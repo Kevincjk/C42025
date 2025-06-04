@@ -1,0 +1,5 @@
+[project]
+name = "devsecops-demo"
+dependencies = [
+    "Flask>=2.0.2"
+]
