@@ -1,0 +1,134 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  ACR_NAMESPACE: my-namespace  # 替换为你的命名空间
+  APP_NAME: devsecops-demo      # 替换为你的应用名称
+  K8S_NAMESPACE: default        # Kubernetes 命名空间
+  K8S_DEPLOYMENT: devsecops-demo # Kubernetes 部署名称
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: '3.9'
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        
+      # SAST 静态应用安全测试
+      - name: Run SAST with Bandit
+        run: |
+          pip install bandit
+          bandit -r . -f json -o bandit-report.json || true
+      
+      - name: Upload Bandit Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: bandit-report
+          path: bandit-report.json
+      
+      # IaC 基础设施即代码扫描
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          
+      - name: Trivy IaC Scan
+        run: |
+          trivy config --exit-code 1 --severity HIGH,CRITICAL .
+      
+      # 容器镜像安全扫描
+      - name: Build Docker Image
+        run: docker build -t ${{ env.APP_NAME }}:${{ github.sha }} .
+      
+      - name: Trivy Container Scan
+        run: |
+          trivy image --exit-code 1 --severity HIGH,CRITICAL ${{ env.APP_NAME }}:${{ github.sha }}
+  
+  build-and-push:
+    needs: security-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ secrets.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      
+      - name: Build and Push Docker Image
+        run: |
+          docker build -t ${{ secrets.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ env.APP_NAME }}:${{ github.sha }} .
+          docker push ${{ secrets.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ env.APP_NAME }}:${{ github.sha }}
+          
+          # 同时推送 latest 标签
+          docker tag ${{ secrets.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ env.APP_NAME }}:${{ github.sha }} ${{ secrets.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ env.APP_NAME }}:latest
+          docker push ${{ secrets.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ env.APP_NAME }}:latest
+      
+      - name: Save image info
+        run: echo "${{ secrets.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ env.APP_NAME }}:${{ github.sha }}" > image.txt
+      
+      - name: Upload image info
+        uses: actions/upload-artifact@v3
+        with:
+          name: image-info
+          path: image.txt
+
+  deploy-to-k8s:
+    needs: build-and-push
+    if: ${{ github.ref == 'refs/heads/main' }}  # 仅 main 分支部署
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download image info
+        uses: actions/download-artifact@v3
+        with:
+          name: image-info
+      
+      - name: Set image tag
+        id: set-image
+        run: echo "IMAGE=$(cat image.txt)" >> $GITHUB_ENV
+      
+      - name: Configure Kubernetes
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBECONFIG }}
+      
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl config set-context --current --namespace=${{ env.K8S_NAMESPACE }}
+          kubectl apply -f deployment.yaml
+          kubectl set image deployment/${{ env.K8S_DEPLOYMENT }} ${{ env.APP_NAME }}=${{ env.IMAGE }}
+          kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT }}
+      
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }}
+          kubectl get svc -n ${{ env.K8S_NAMESPACE }}
+
+  notification:
+    needs: [security-scan, deploy-to-k8s]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send status notification
+        run: |
+          echo "Pipeline status: ${{ job.status }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Workflow: ${{ github.workflow }}"
+          echo "Commit: ${{ github.sha }}"
+        # 实际项目中替换为真实通知机制
